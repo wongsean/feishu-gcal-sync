@@ -1,0 +1,18 @@
+[Unit]
+Description=Mirror Feishu calendar into Google Calendar (one reconcile run)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=fgs
+Group=fgs
+WorkingDirectory=/var/lib/feishu-gcal-sync
+ExecStart=/opt/feishu-gcal-sync/.venv/bin/fgs --env-file /etc/feishu-gcal-sync/env sync
+TimeoutStartSec=15min
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/feishu-gcal-sync

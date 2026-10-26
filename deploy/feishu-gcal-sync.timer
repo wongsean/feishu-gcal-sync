@@ -1,0 +1,12 @@
+[Unit]
+Description=Run feishu-gcal-sync every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+# Spread runs out a little, as Google recommends for periodic sync jobs.
+RandomizedDelaySec=150
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
