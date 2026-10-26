@@ -6,7 +6,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from .config import Config
-from .errors import GoogleApiError, SafetyAbort
+from .errors import GoogleApiError, GoogleWritesFailed, SafetyAbort
 from .feishu_calendar import FeishuCalendar
 from .google_calendar import GoogleCalendar
 from .model import event_bounds, google_event_id, should_mirror, to_google_event
@@ -64,10 +64,9 @@ def run_sync(
     window = sync_window(cfg, now or datetime.now(UTC))
     existing = google.list_managed(window[0] - LIST_PAD, window[1] + LIST_PAD)
     span = feishu_span(window, existing)
-    calendar_id = feishu.primary_calendar_id()
     # Any Feishu failure raises before anything is written: a failed read must never be
     # mistaken for an empty calendar.
-    items = feishu.instances(calendar_id, *span)
+    items = feishu.primary_instances(*span)
 
     wanted: dict[str, dict] = {}
     protected: set[str] = set()
@@ -102,7 +101,7 @@ def run_sync(
     if dry_run:
         return plan
 
-    failures: list[str] = []
+    failures: list[GoogleApiError] = []
     for op, arg in (
         [(google.insert, body) for body in plan.insert]
         + [(google.update, body) for body in plan.update]
@@ -113,7 +112,15 @@ def run_sync(
         except GoogleApiError as exc:
             # One bad event shouldn't block the rest; quota and transient errors still abort.
             log.error("%s failed: %s", op.__name__, exc)
-            failures.append(str(exc))
+            failures.append(exc)
     if failures:
-        raise GoogleApiError(f"{len(failures)} 个 Google 写入失败，第一个：{failures[0]}")
+        message = f"{len(failures)} 个 Google 写入失败，第一个：{failures[0]}"
+        # 401/403 (quota and rate limits aside, which raise their own errors) mean the
+        # service account can't write to the calendar at all, not that an event is bad.
+        if any(exc.status in (401, 403) for exc in failures):
+            raise GoogleApiError(
+                f"{message}。请检查副日历对 Service Account 的共享权限"
+                "（需要「做出更改并查看活动详情」）"
+            )
+        raise GoogleWritesFailed(message)
     return plan

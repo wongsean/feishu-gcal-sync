@@ -1,7 +1,9 @@
 [Unit]
 Description=Mirror Feishu calendar into Google Calendar (one reconcile run)
 Wants=network-online.target
-After=network-online.target
+# Google rejects service-account tokens signed with a wrong clock. time-sync.target only
+# waits for one where a wait-for-sync service (such as chrony-wait) is enabled.
+After=network-online.target time-sync.target
 
 [Service]
 Type=oneshot
@@ -10,9 +12,33 @@ Group=fgs
 WorkingDirectory=/var/lib/feishu-gcal-sync
 ExecStart=/opt/feishu-gcal-sync/.venv/bin/fgs --env-file /etc/feishu-gcal-sync/env sync
 TimeoutStartSec=15min
+# SIGTERM waits while a refresh_token rotation is on the wire: up to two requests with 30s
+# connect and read timeouts, plus DNS lookups no timeout covers. Being killed then loses
+# the grant.
+TimeoutStopSec=4min
+UMask=0077
+MemoryMax=256M
 
-NoNewPrivileges=yes
-PrivateTmp=yes
+ReadWritePaths=/var/lib/feishu-gcal-sync
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/feishu-gcal-sync
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

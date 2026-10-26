@@ -23,6 +23,12 @@ dev = [
     "ruff>=0.6",
 ]
 
+[tool.uv]
+# The VPS installs the project as a regular package (--no-editable). By default uv only
+# rebuilds it when pyproject.toml changes, so a `git pull` that touches only source files
+# would keep running the old code.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

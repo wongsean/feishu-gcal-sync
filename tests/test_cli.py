@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import re
 import time
+from pathlib import Path
 
 import pytest
+import requests
+from conftest import FakeResponse, FakeSession
 
 from feishu_gcal_sync import cli
-from feishu_gcal_sync.feishu_auth import GRANT_LIFETIME, Token, TokenStore
+from feishu_gcal_sync.errors import FeishuQuotaExhausted, GoogleApiError, GoogleWritesFailed
+from feishu_gcal_sync.feishu_auth import GRANT_LIFETIME, REFRESH_MARGIN, Token, TokenStore
 from feishu_gcal_sync.fsutil import RunLock
 
 
@@ -26,6 +31,34 @@ def env_file(tmp_path, monkeypatch):
 def alerts(tmp_path) -> dict:
     path = tmp_path / "state" / cli.ALERTS_FILE
     return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save_token(tmp_path, access_left: float = 7200, granted_ago: float = 0) -> None:
+    now = time.time()
+    TokenStore(tmp_path / "state" / cli.TOKEN_FILE).save(
+        Token(
+            "a",
+            now + access_left,
+            "r",
+            now + 600000,
+            "calendar:calendar:readonly",
+            now - granted_ago,
+        )
+    )
+
+
+def token_response() -> FakeResponse:
+    return FakeResponse(
+        200,
+        {
+            "code": 0,
+            "access_token": "u",
+            "expires_in": 7200,
+            "refresh_token": "r-new",
+            "refresh_token_expires_in": 604800,
+            "scope": "calendar:calendar:readonly offline_access",
+        },
+    )
 
 
 def test_sync_without_authorization_alerts(env_file, tmp_path):
@@ -130,6 +163,87 @@ def test_cooldown_run_clears_other_failures_and_pings(env_file, tmp_path, monkey
     assert pings == [1]
 
 
+@pytest.mark.parametrize(
+    ("error", "pings", "left"),
+    [
+        (GoogleWritesFailed("1 个 Google 写入失败"), [1], {"google_writes"}),
+        (GoogleApiError("list failed"), [], {"google_api", "feishu_quota"}),
+    ],
+)
+def test_only_rejected_events_keep_the_heartbeat_and_clear_old_failures(
+    env_file, tmp_path, monkeypatch, error, pings, left
+):
+    def failing(*a, **k):
+        raise error
+
+    monkeypatch.setattr(cli, "run_sync", failing)
+    sent = []
+    monkeypatch.setattr(cli, "_heartbeat", lambda cfg, session: sent.append(1) or True)
+    save_token(tmp_path)
+    old = {"since": time.time() - 86400, "last": time.time() - 86400, "sent": None}
+    (tmp_path / "state" / cli.ALERTS_FILE).write_text(json.dumps({"feishu_quota": old}))
+    assert cli.main(["--env-file", str(env_file), "sync"]) == 1
+    assert alerts(tmp_path)[error.alert_key]["sent"] is not None
+    assert set(alerts(tmp_path)) == left
+    assert sent == pings
+
+
+def test_used_up_feishu_quota_alerts_at_once(env_file, tmp_path, monkeypatch):
+    def failing(*a, **k):
+        raise FeishuQuotaExhausted("飞书租户本月的 API 调用量已用完")
+
+    monkeypatch.setattr(cli, "run_sync", failing)
+    save_token(tmp_path)
+    assert cli.main(["--env-file", str(env_file), "sync"]) == 1
+    assert alerts(tmp_path)["feishu_quota"]["sent"] is not None
+
+
+@pytest.mark.parametrize(
+    ("access_left", "calls", "alert", "sent_now"),
+    [
+        # Too short to last a run: renewed up front, so a rejection is no glitch.
+        (cli.RUN_TOKEN_MARGIN - 60, ["feishu-token", "google", "feishu"], "feishu_api", True),
+        # Issued by an earlier run and rejected now: dropped, the next run renews it.
+        (cli.RUN_TOKEN_MARGIN + 60, ["google", "feishu"], "feishu_transient", False),
+    ],
+)
+def test_token_rotates_only_before_google_starts(
+    env_file, tmp_path, monkeypatch, access_left, calls, alert, sent_now
+):
+    seen = []
+
+    class NoMirrors:
+        def list_managed(self, time_min, time_max):
+            seen.append("google")
+            return []
+
+    def handler(method, url, **kwargs):
+        if url.endswith("/oauth/v3/token"):
+            seen.append("feishu-token")
+            return token_response()
+        seen.append("feishu")
+        return FakeResponse(401, {"code": 99991668, "msg": "invalid access token"})
+
+    monkeypatch.setattr(cli.requests, "Session", lambda: FakeSession(handler))
+    monkeypatch.setattr(
+        cli.GoogleCalendar, "from_key_file", classmethod(lambda c, k, i: NoMirrors())
+    )
+    save_token(tmp_path, access_left=access_left)
+
+    assert cli.main(["--env-file", str(env_file), "sync"]) == 1
+    assert seen[: len(calls)] == calls
+    assert "feishu-token" not in seen[len(calls) :]
+    assert TokenStore(tmp_path / "state" / cli.TOKEN_FILE).load().access_expires_at == 0
+    assert (alerts(tmp_path)[alert]["sent"] is not None) == sent_now
+
+
+def test_run_token_margin_outlasts_the_service_timeout():
+    unit = Path(__file__).parent.parent / "deploy" / "feishu-gcal-sync.service"
+    timeout = re.search(r"^TimeoutStartSec=(\d+)min$", unit.read_text(), re.M)
+    # A held token must not hit the ordinary refresh margin before systemd stops the run.
+    assert int(timeout.group(1)) * 60 <= cli.RUN_TOKEN_MARGIN - REFRESH_MARGIN
+
+
 def test_broken_pipe_in_dry_run_is_not_an_alert(env_file, tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "run_sync", lambda *a, **k: cli.Plan())
     monkeypatch.setattr(cli, "_print_plan", lambda plan: (_ for _ in ()).throw(BrokenPipeError()))
@@ -143,32 +257,37 @@ def test_broken_pipe_in_dry_run_is_not_an_alert(env_file, tmp_path, monkeypatch)
     assert alerts(tmp_path) == {}
 
 
-def test_auth_reports_saved_grant_even_if_calendar_check_fails(
-    env_file, tmp_path, monkeypatch, capsys
-):
-    import requests
-    from conftest import FakeResponse, FakeSession
-
-    def handler(method, url, **kwargs):
-        if url.endswith("/oauth/v3/token"):
-            return FakeResponse(
-                200,
-                {
-                    "code": 0,
-                    "access_token": "u",
-                    "expires_in": 7200,
-                    "refresh_token": "r-new",
-                    "refresh_token_expires_in": 604800,
-                    "scope": "calendar:calendar:readonly offline_access",
-                },
-            )
-        return requests.ConnectionError("blip")
-
+def run_auth(env_file, monkeypatch, handler) -> int:
     monkeypatch.setattr(cli.requests, "Session", lambda: FakeSession(handler))
     monkeypatch.setattr(cli.secrets, "token_urlsafe", lambda n: "st")
     monkeypatch.setattr(
         "builtins.input", lambda prompt="": "http://localhost:8765/callback?code=c&state=st"
     )
-    assert cli.main(["--env-file", str(env_file), "auth", "--manual"]) == 0
+    return cli.main(["--env-file", str(env_file), "auth", "--manual"])
+
+
+def test_auth_reports_saved_grant_even_if_calendar_check_fails(
+    env_file, tmp_path, monkeypatch, capsys
+):
+    def handler(method, url, **kwargs):
+        if url.endswith("/oauth/v3/token"):
+            return token_response()
+        return requests.ConnectionError("blip")
+
+    assert run_auth(env_file, monkeypatch, handler) == 0
     assert "授权成功，已保存" in capsys.readouterr().out
     assert TokenStore(tmp_path / "state" / cli.TOKEN_FILE).load().refresh_token == "r-new"
+
+
+def test_auth_remembers_the_calendar_under_the_new_grant(env_file, tmp_path, monkeypatch, capsys):
+    def handler(method, url, **kwargs):
+        if url.endswith("/oauth/v3/token"):
+            return token_response()
+        calendars = [{"calendar": {"calendar_id": "cal-new"}}]
+        return FakeResponse(200, {"code": 0, "data": {"calendars": calendars}})
+
+    assert run_auth(env_file, monkeypatch, handler) == 0
+    assert "主日历：cal-new" in capsys.readouterr().out
+    token = TokenStore(tmp_path / "state" / cli.TOKEN_FILE).load()
+    remembered = json.loads((tmp_path / "state" / cli.CALENDAR_ID_FILE).read_text())
+    assert remembered == {"granted_at": token.granted_at, "calendar_id": "cal-new"}
