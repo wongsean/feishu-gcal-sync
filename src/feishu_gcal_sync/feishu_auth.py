@@ -20,12 +20,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import requests
 
 from .config import Config
-from .errors import (
-    FeishuApiError,
-    FeishuConfigError,
-    FeishuReauthRequired,
-    FeishuTransientError,
-)
+from .errors import FeishuConfigError, FeishuReauthRequired, FeishuTransientError
 from .fsutil import ReservedFile, atomic_write_text
 
 log = logging.getLogger(__name__)
@@ -123,7 +118,6 @@ class FeishuAuth:
         self.clock = clock
         self.sleep = sleep
         self._refresh_held = False
-        self._refreshed = False
 
     @property
     def _token_url(self) -> str:
@@ -170,12 +164,10 @@ class FeishuAuth:
         if token.access_expires_at - self.clock() > margin:
             return token.access_token
         if self._refresh_held:
-            if self._refreshed:
-                # Minted at the start of this run to last all of it: Feishu rejected it.
-                raise FeishuApiError(
-                    "飞书拒绝了刚刷新的 access_token，检查应用是否被停用或权限被收回"
-                )
-            raise FeishuTransientError("飞书 access_token 在本轮中途失效，下一轮开始时会先刷新")
+            raise FeishuTransientError(
+                "飞书 access_token 在本轮中途失效，下一轮开始时会先刷新"
+                "（一直出现的话，检查应用是否被停用或权限被收回）"
+            )
         return self._refresh(token).access_token
 
     def hold_refresh(self) -> None:
@@ -215,7 +207,6 @@ class FeishuAuth:
                 body = self._post_token(form)
             new = Token.from_response(body, now=self.clock(), granted_at=token.granted_at)
             save(new)
-        self._refreshed = True
         log.info("refreshed Feishu user token")
         if CALENDAR_SCOPE not in new.scope.split():
             # Only a warning: if the scope is really gone, the calendar calls fail loudly.

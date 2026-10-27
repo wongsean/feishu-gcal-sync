@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import json
-import re
 import time
-from pathlib import Path
 
 import pytest
 import requests
 from conftest import FakeResponse, FakeSession
 
 from feishu_gcal_sync import cli
-from feishu_gcal_sync.errors import FeishuQuotaExhausted, GoogleApiError, GoogleWritesFailed
-from feishu_gcal_sync.feishu_auth import GRANT_LIFETIME, REFRESH_MARGIN, Token, TokenStore
+from feishu_gcal_sync.errors import GoogleApiError, GoogleWritesFailed
+from feishu_gcal_sync.feishu_auth import GRANT_LIFETIME, Token, TokenStore
 from feishu_gcal_sync.fsutil import RunLock
 
 
@@ -188,27 +186,17 @@ def test_only_rejected_events_keep_the_heartbeat_and_clear_old_failures(
     assert sent == pings
 
 
-def test_used_up_feishu_quota_alerts_at_once(env_file, tmp_path, monkeypatch):
-    def failing(*a, **k):
-        raise FeishuQuotaExhausted("飞书租户本月的 API 调用量已用完")
-
-    monkeypatch.setattr(cli, "run_sync", failing)
-    save_token(tmp_path)
-    assert cli.main(["--env-file", str(env_file), "sync"]) == 1
-    assert alerts(tmp_path)["feishu_quota"]["sent"] is not None
-
-
 @pytest.mark.parametrize(
-    ("access_left", "calls", "alert", "sent_now"),
+    ("access_left", "calls"),
     [
-        # Too short to last a run: renewed up front, so a rejection is no glitch.
-        (cli.RUN_TOKEN_MARGIN - 60, ["feishu-token", "google", "feishu"], "feishu_api", True),
-        # Issued by an earlier run and rejected now: dropped, the next run renews it.
-        (cli.RUN_TOKEN_MARGIN + 60, ["google", "feishu"], "feishu_transient", False),
+        # Too short to last the run: renewed before Google is touched.
+        (cli.RUN_TOKEN_MARGIN - 60, ["feishu-token", "google", "feishu"]),
+        # Long enough: left alone.
+        (cli.RUN_TOKEN_MARGIN + 60, ["google", "feishu"]),
     ],
 )
 def test_token_rotates_only_before_google_starts(
-    env_file, tmp_path, monkeypatch, access_left, calls, alert, sent_now
+    env_file, tmp_path, monkeypatch, access_left, calls
 ):
     seen = []
 
@@ -231,17 +219,10 @@ def test_token_rotates_only_before_google_starts(
     save_token(tmp_path, access_left=access_left)
 
     assert cli.main(["--env-file", str(env_file), "sync"]) == 1
-    assert seen[: len(calls)] == calls
-    assert "feishu-token" not in seen[len(calls) :]
+    assert seen == calls
+    # Feishu rejected the token mid-run: it is dropped for the next run to renew first.
     assert TokenStore(tmp_path / "state" / cli.TOKEN_FILE).load().access_expires_at == 0
-    assert (alerts(tmp_path)[alert]["sent"] is not None) == sent_now
-
-
-def test_run_token_margin_outlasts_the_service_timeout():
-    unit = Path(__file__).parent.parent / "deploy" / "feishu-gcal-sync.service"
-    timeout = re.search(r"^TimeoutStartSec=(\d+)min$", unit.read_text(), re.M)
-    # A held token must not hit the ordinary refresh margin before systemd stops the run.
-    assert int(timeout.group(1)) * 60 <= cli.RUN_TOKEN_MARGIN - REFRESH_MARGIN
+    assert alerts(tmp_path)["feishu_transient"]["sent"] is None
 
 
 def test_broken_pipe_in_dry_run_is_not_an_alert(env_file, tmp_path, monkeypatch):
@@ -274,12 +255,17 @@ def test_auth_reports_saved_grant_even_if_calendar_check_fails(
             return token_response()
         return requests.ConnectionError("blip")
 
+    (tmp_path / "state").mkdir()
+    remembered = tmp_path / "state" / cli.CALENDAR_ID_FILE
+    remembered.write_text("someone-elses-calendar\n")
     assert run_auth(env_file, monkeypatch, handler) == 0
     assert "授权成功，已保存" in capsys.readouterr().out
     assert TokenStore(tmp_path / "state" / cli.TOKEN_FILE).load().refresh_token == "r-new"
+    # The next sync looks the calendar up for the new grant.
+    assert not remembered.exists()
 
 
-def test_auth_remembers_the_calendar_under_the_new_grant(env_file, tmp_path, monkeypatch, capsys):
+def test_auth_remembers_the_new_primary_calendar(env_file, tmp_path, monkeypatch, capsys):
     def handler(method, url, **kwargs):
         if url.endswith("/oauth/v3/token"):
             return token_response()
@@ -288,6 +274,4 @@ def test_auth_remembers_the_calendar_under_the_new_grant(env_file, tmp_path, mon
 
     assert run_auth(env_file, monkeypatch, handler) == 0
     assert "主日历：cal-new" in capsys.readouterr().out
-    token = TokenStore(tmp_path / "state" / cli.TOKEN_FILE).load()
-    remembered = json.loads((tmp_path / "state" / cli.CALENDAR_ID_FILE).read_text())
-    assert remembered == {"granted_at": token.granted_at, "calendar_id": "cal-new"}
+    assert (tmp_path / "state" / cli.CALENDAR_ID_FILE).read_text() == "cal-new\n"

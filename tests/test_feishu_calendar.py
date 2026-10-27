@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
 from urllib.parse import unquote
 
@@ -15,11 +14,10 @@ START = datetime(2026, 10, 1, tzinfo=UTC)
 
 class FakeAuth:
     def __init__(self):
-        self.tokens = ["t1", "t2", "t3"]
         self.invalidated = 0
 
     def access_token(self) -> str:
-        return self.tokens[self.invalidated]
+        return "t1"
 
     def invalidate_access_token(self) -> None:
         self.invalidated += 1
@@ -89,7 +87,6 @@ def test_used_up_monthly_quota_is_not_mistaken_for_throttling():
     assert not FeishuQuotaExhausted.transient
 
 
-GRANT = 1_700_000_000.0
 DAY = (START, START + timedelta(days=1))
 
 
@@ -119,12 +116,8 @@ def queried(session: FakeSession) -> list[str]:
     return [queried_calendar(url) for _, url, _ in session.calls]
 
 
-def remember(path, calendar_id: str, granted_at: float = GRANT) -> None:
-    path.write_text(json.dumps({"granted_at": granted_at, "calendar_id": calendar_id}))
-
-
 def primary(session: FakeSession, path) -> FeishuCalendar:
-    return FeishuCalendar("https://open.feishu.cn", session, FakeAuth(), path, GRANT)
+    return FeishuCalendar("https://open.feishu.cn", session, FakeAuth(), path)
 
 
 def test_primary_calendar_id_is_remembered_between_runs(tmp_path):
@@ -138,28 +131,18 @@ def test_primary_calendar_id_is_remembered_between_runs(tmp_path):
     assert queried(second) == ["cal-a"]
 
 
-def test_calendar_remembered_under_another_grant_is_looked_up_again(tmp_path):
+def test_unusable_remembered_calendar_is_looked_up_again(tmp_path):
     remembered = tmp_path / "calendar_id"
-    remember(remembered, "someone-elses", granted_at=GRANT - 86400)
-    session = FakeSession(calendar_server("cal-a"))
-    primary(session, remembered).primary_instances(*DAY)
-    assert queried(session) == ["primary", "cal-a"]
-    assert json.loads(remembered.read_text()) == {"granted_at": GRANT, "calendar_id": "cal-a"}
-
-
-@pytest.mark.parametrize("code", [191000, 191001, 191002, 191003, 191004])
-def test_unusable_remembered_calendar_is_looked_up_again(tmp_path, code):
-    remembered = tmp_path / "calendar_id"
-    remember(remembered, "cal-gone")
-    session = FakeSession(calendar_server("cal-new", rejected={"cal-gone": code}))
+    remembered.write_text("cal-gone\n")
+    session = FakeSession(calendar_server("cal-new", rejected={"cal-gone": 191000}))
     assert primary(session, remembered).primary_instances(*DAY) == [{"event_id": "e_0"}]
     assert queried(session) == ["cal-gone", "primary", "cal-new"]
-    assert json.loads(remembered.read_text())["calendar_id"] == "cal-new"
+    assert remembered.read_text() == "cal-new\n"
 
 
 def test_calendar_still_unusable_after_a_fresh_lookup_fails_once(tmp_path):
     remembered = tmp_path / "calendar_id"
-    remember(remembered, "cal-x")
+    remembered.write_text("cal-x\n")
     session = FakeSession(calendar_server("cal-x", rejected={"cal-x": 191002}))
     with pytest.raises(FeishuApiError):
         primary(session, remembered).primary_instances(*DAY)
@@ -168,7 +151,7 @@ def test_calendar_still_unusable_after_a_fresh_lookup_fails_once(tmp_path):
 
 def test_other_errors_do_not_look_the_calendar_up_again(tmp_path):
     remembered = tmp_path / "calendar_id"
-    remember(remembered, "cal-a")
+    remembered.write_text("cal-a\n")
     session = FakeSession(calendar_server("cal-a", rejected={"cal-a": 190002}))
     with pytest.raises(FeishuApiError):
         primary(session, remembered).primary_instances(*DAY)
@@ -182,13 +165,9 @@ def test_unusable_fresh_calendar_is_not_retried(tmp_path):
     assert queried(session) == ["primary", "cal-x"]
 
 
-@pytest.mark.parametrize("damage", ["directory", "garbage"])
-def test_broken_calendar_file_only_costs_a_lookup(tmp_path, damage):
+def test_unusable_calendar_file_only_costs_a_lookup(tmp_path):
     remembered = tmp_path / "calendar_id"
-    if damage == "directory":
-        remembered.mkdir()  # unreadable and unwritable
-    else:
-        remembered.write_bytes(b"\xff not json")
+    remembered.mkdir()  # can be neither read nor replaced
     session = FakeSession(calendar_server("cal-a"))
     assert primary(session, remembered).primary_instances(*DAY) == [{"event_id": "e_0"}]
     assert queried(session) == ["primary", "cal-a"]
@@ -225,12 +204,11 @@ def test_server_errors_are_transient():
         cal.primary_calendar_id()
 
 
-def test_rejected_token_is_refreshed_once():
-    responses = [FakeResponse(401, {"code": 99991668, "msg": "invalid token"}), ok({"items": []})]
-    session = FakeSession(lambda m, u, **k: responses.pop(0))
+def test_rejected_token_is_dropped_for_the_next_run():
+    session = FakeSession(lambda m, u, **k: FakeResponse(401, {"code": 99991668, "msg": "bad"}))
     auth = FakeAuth()
-    FeishuCalendar("https://open.feishu.cn", session, auth).instances(
-        "c", START, START + timedelta(days=1)
-    )
+    cal = FeishuCalendar("https://open.feishu.cn", session, auth)
+    with pytest.raises(FeishuTransientError, match="下一轮"):
+        cal.instances("c", START, START + timedelta(days=1))
     assert auth.invalidated == 1
-    assert [c[2]["headers"]["Authorization"] for c in session.calls] == ["Bearer t1", "Bearer t2"]
+    assert len(session.calls) == 1

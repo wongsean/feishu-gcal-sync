@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -31,7 +30,7 @@ _SPAN_TOO_WIDE = 193103
 _TOO_MANY_INSTANCES = 193104
 # The calendar id is no good (any more): not found, invalid, no access, deleted, wrong type.
 _CALENDAR_UNUSABLE = {191000, 191001, 191002, 191003, 191004}
-# Gateway rejections of the access token itself; a fresh token is worth one retry.
+# Gateway rejections of the access token itself.
 _TOKEN_REJECTED = {99991663, 99991668, 99991677}
 # Gateway throttling, plus calendar per-method / per-app / contention throttling.
 _THROTTLED = {99991400, 190004, 190005, 190010}
@@ -52,16 +51,12 @@ class FeishuCalendar:
         session: requests.Session,
         auth: TokenSource,
         calendar_id_file: Path | None = None,
-        granted_at: float | None = None,
     ):
         self.base_url = base_url
         self.session = session
         self.auth = auth
-        # Remembers the primary calendar id between runs, tagged with the grant (its
-        # granted_at) it was looked up under: any other grant, possibly another user's,
-        # looks it up afresh.
+        # Remembers the primary calendar id between runs; `fgs auth` deletes it.
         self.calendar_id_file = calendar_id_file
-        self.granted_at = granted_at
 
     def primary_calendar_id(self) -> str:
         """Ask Feishu for the user's primary calendar, and remember it in calendar_id_file."""
@@ -92,23 +87,18 @@ class FeishuCalendar:
         if self.calendar_id_file is None:
             return None
         try:
-            saved = json.loads(self.calendar_id_file.read_text(encoding="utf-8"))
+            return self.calendar_id_file.read_text(encoding="utf-8").strip() or None
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as exc:
             log.warning("ignoring unreadable %s: %s", self.calendar_id_file, exc)
             return None
-        if not isinstance(saved, dict) or saved.get("granted_at") != self.granted_at:
-            return None
-        calendar_id = saved.get("calendar_id")
-        return calendar_id if isinstance(calendar_id, str) and calendar_id else None
 
     def _remember(self, calendar_id: str) -> None:
         if self.calendar_id_file is None:
             return
-        saved = {"granted_at": self.granted_at, "calendar_id": calendar_id}
         try:
-            atomic_write_text(self.calendar_id_file, json.dumps(saved) + "\n")
+            atomic_write_text(self.calendar_id_file, calendar_id + "\n")
         except OSError as exc:
             # Only costs the lookup again next run.
             log.warning("cannot write %s: %s", self.calendar_id_file, exc)
@@ -153,17 +143,6 @@ class FeishuCalendar:
         return data.get("items") or []
 
     def _call(self, method: str, path: str, params: dict | None = None) -> dict:
-        try:
-            return self._call_once(method, path, params)
-        except _TokenRejected as exc:
-            log.warning("Feishu rejected the access token: %s", exc)
-            self.auth.invalidate_access_token()
-            try:
-                return self._call_once(method, path, params)
-            except _TokenRejected as exc:
-                raise FeishuApiError(f"飞书拒绝了刚刷新的 access_token：{exc}") from None
-
-    def _call_once(self, method: str, path: str, params: dict | None) -> dict:
         headers = {"Authorization": f"Bearer {self.auth.access_token()}"}
         kwargs: dict = {"params": params, "headers": headers, "timeout": 30}
         if method == "POST":
@@ -181,7 +160,12 @@ class FeishuCalendar:
             return body.get("data") or {}
         detail = f"{path}: code={code} msg={body.get('msg')} (HTTP {resp.status_code})"
         if code in _TOKEN_REJECTED:
-            raise _TokenRejected(detail)
+            # Renewing it mid-run is not allowed (FeishuAuth.hold_refresh); the next run will.
+            self.auth.invalidate_access_token()
+            raise FeishuTransientError(
+                "飞书拒绝了 access_token，下一轮开始时会先刷新"
+                f"（一直出现的话，检查应用是否被停用或权限被收回）：{detail}"
+            )
         if code == _TENANT_QUOTA_EXHAUSTED:
             raise FeishuQuotaExhausted(
                 "飞书租户本月的 API 调用量已用完（基础免费版所有自建应用共用每月上限），"
@@ -191,7 +175,3 @@ class FeishuCalendar:
             raise FeishuTransientError(f"飞书接口暂时不可用：{detail}")
         api_code = code if isinstance(code, int) else None
         raise FeishuApiError(f"飞书接口报错：{detail}", code=api_code)
-
-
-class _TokenRejected(Exception):
-    pass

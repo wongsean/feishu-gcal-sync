@@ -7,12 +7,7 @@ import pytest
 import requests
 from conftest import FakeResponse, FakeSession, queue
 
-from feishu_gcal_sync.errors import (
-    FeishuApiError,
-    FeishuConfigError,
-    FeishuReauthRequired,
-    FeishuTransientError,
-)
+from feishu_gcal_sync.errors import FeishuConfigError, FeishuReauthRequired, FeishuTransientError
 from feishu_gcal_sync.feishu_auth import (
     GRANT_LIFETIME,
     FeishuAuth,
@@ -185,17 +180,6 @@ def test_held_refresh_never_rotates(cfg):
         auth.access_token()
     assert session.calls == []
     assert store.load().refresh_token == old.refresh_token
-
-
-def test_rejection_of_a_token_refreshed_this_run_is_not_transient(cfg):
-    auth, session, store = make_auth(cfg, queue(FakeResponse(200, token_body())))
-    stored_token(store, access_left=0)
-    assert auth.access_token() == "u-new"
-    auth.hold_refresh()
-    auth.invalidate_access_token()
-    with pytest.raises(FeishuApiError, match="刚刷新"):
-        auth.access_token()
-    assert len(session.calls) == 1
 
 
 def test_invalidate_forces_refresh(cfg):

@@ -32,10 +32,9 @@ class FakeFeishu:
 
 
 class FakeGoogle:
-    def __init__(self, existing=None, fail_ids=(), fail_status=400):
+    def __init__(self, existing=None, fail_ids=()):
         self.existing = existing or []
         self.fail_ids = set(fail_ids)
-        self.fail_status = fail_status
         self.writes = []
 
     def list_managed(self, time_min, time_max):
@@ -43,7 +42,7 @@ class FakeGoogle:
 
     def _write(self, op, key):
         if key in self.fail_ids:
-            raise GoogleApiError(f"bad {key}", status=self.fail_status)
+            raise GoogleApiError(f"bad {key}", status=400)
         self.writes.append((op, key))
 
     def insert(self, body):
@@ -122,17 +121,6 @@ def test_one_failed_write_does_not_block_the_rest(cfg):
     google = FakeGoogle(fail_ids={to_google_event(first)["id"]})
     with pytest.raises(GoogleWritesFailed, match="1 个 Google 写入失败"):
         run_sync(cfg, FakeFeishu([first, second]), google, now=NOW)
-    assert google.writes == [("insert", to_google_event(second)["id"])]
-
-
-@pytest.mark.parametrize("status", [401, 403])
-def test_refused_permission_is_not_a_bad_event(cfg, status):
-    first = timed()
-    second = timed(event_id="other_0", summary="另一个")
-    google = FakeGoogle(fail_ids={to_google_event(first)["id"]}, fail_status=status)
-    with pytest.raises(GoogleApiError, match="共享权限") as exc:
-        run_sync(cfg, FakeFeishu([first, second]), google, now=NOW)
-    assert not isinstance(exc.value, GoogleWritesFailed)
     assert google.writes == [("insert", to_google_event(second)["id"])]
 
 

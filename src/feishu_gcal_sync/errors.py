@@ -44,15 +44,14 @@ class FeishuQuotaExhausted(SyncError):
 class GoogleApiError(SyncError):
     alert_key = "google_api"
 
-    def __init__(self, message: str, status: int | None = None, reason: str | None = None):
+    def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
-        self.reason = reason
 
 
 class GoogleWritesFailed(GoogleApiError):
-    """Google rejected some events; both calendars were read, the other writes went through
-    and the service account may write to the calendar."""
+    """Google rejected some writes; both calendars were read and the other writes went
+    through."""
 
     alert_key = "google_writes"
 
