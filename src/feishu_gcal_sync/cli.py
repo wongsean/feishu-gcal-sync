@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 import requests
 
 from .config import Config, ConfigError, load_env_file
-from .errors import GoogleQuotaError, SyncError
+from .errors import GoogleQuotaError, GoogleWritesFailed, SyncError
 from .feishu_auth import FeishuAuth, TokenStore, parse_callback, wait_for_callback
 from .feishu_calendar import FeishuCalendar
 from .fsutil import LockBusy, RunLock
@@ -28,8 +28,13 @@ from .sync import run_sync
 log = logging.getLogger("feishu_gcal_sync")
 
 TOKEN_FILE = "feishu_token.json"
+CALENDAR_ID_FILE = "feishu_calendar_id"
 ALERTS_FILE = "alerts.json"
 LOCK_FILE = "run.lock"
+# A sync renews the Feishu access token up front if it has less than this left, so it still
+# has REFRESH_MARGIN to spare when Feishu is read, after a Google listing that may spend
+# minutes in retries.
+RUN_TOKEN_MARGIN = 20 * 60
 # Transient failures (network, 5xx, rate limits) only alert after lasting this long.
 TRANSIENT_GRACE = 3600
 # After Google's usage limit trips, keep reading but stop writing for this long.
@@ -131,8 +136,11 @@ def cmd_auth(cfg: Config, args: argparse.Namespace) -> int:
 
     # Only the exchange holds the lock: it waits for a running sync, which could otherwise
     # store a refresh of the old grant over the new token.
+    calendar_id_file = cfg.state_dir / CALENDAR_ID_FILE
     try:
         with RunLock(cfg.state_dir / LOCK_FILE, blocking=True):
+            # The remembered calendar belongs to the previous grant, maybe another user's.
+            calendar_id_file.unlink(missing_ok=True)
             token = auth.exchange_code(code)
     except SyncError as exc:
         print(f"授权失败：{exc}", file=sys.stderr)
@@ -143,11 +151,12 @@ def cmd_auth(cfg: Config, args: argparse.Namespace) -> int:
     print("\n授权成功，已保存。")
     try:
         with RunLock(cfg.state_dir / LOCK_FILE, blocking=True):
-            calendar_id = FeishuCalendar(cfg.feishu_open_url, session, auth).primary_calendar_id()
+            feishu = FeishuCalendar(cfg.feishu_open_url, session, auth, calendar_id_file)
+            calendar_id = feishu.primary_calendar_id()
         print(f"  主日历：{calendar_id}")
     except SyncError as exc:
         print(f"  读取主日历失败（授权本身已保存，可稍后用 `fgs sync --dry-run` 检查）：{exc}")
-    print(f"  refresh_token 到期：{_fmt(token.refresh_expires_at)}（每次同步都会自动续期）")
+    print(f"  refresh_token 到期：{_fmt(token.refresh_expires_at)}（定时任务运行期间会自动续期）")
     print(f"  365 天授权上限：{_fmt(token.grant_expires_at)}，到期前需再次运行 `fgs auth`")
     return 0
 
@@ -181,9 +190,13 @@ def _locked_sync(
     hold_writes = _quota_cooldown(alerts)
     try:
         # Renew the Feishu token before anything Google-side can fail, so a broken Google
-        # setup can't let the ~7-day refresh_token lapse.
-        auth.access_token()
-        feishu = FeishuCalendar(cfg.feishu_open_url, session, auth)
+        # setup can't let the ~7-day refresh_token lapse. Renew it for the whole run, too,
+        # then rule out rotating it later: the first Google request starts a thread.
+        auth.access_token(margin=RUN_TOKEN_MARGIN)
+        auth.hold_refresh()
+        feishu = FeishuCalendar(
+            cfg.feishu_open_url, session, auth, cfg.state_dir / CALENDAR_ID_FILE
+        )
         google = GoogleCalendar.from_key_file(cfg.google_sa_key_file, cfg.google_calendar_id)
         plan = run_sync(
             cfg, feishu, google, dry_run=args.dry_run or hold_writes, allow_empty=args.allow_empty
@@ -200,6 +213,16 @@ def _locked_sync(
         if not args.dry_run:
             alerts.fire(key, text, grace=grace)
             _check_grant_deadline(cfg, auth, alerts)
+            if isinstance(exc, GoogleWritesFailed):
+                # Both calendars were read and the other writes went through, so the job is
+                # alive and every other failure is over; the alert above covers the rejected
+                # events. Without the ping, one event Google keeps refusing would keep the
+                # heartbeat check down for good.
+                alerts.resolve_failures(
+                    "✅ feishu-gcal-sync 其他问题已恢复（仍有个别事件写入失败）",
+                    keep=frozenset({exc.alert_key}),
+                )
+                _heartbeat(cfg, session)
         return 1
 
     if args.dry_run:

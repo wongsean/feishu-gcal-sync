@@ -138,7 +138,6 @@ class GoogleCalendar:
                     raise GoogleApiError(
                         f"Google 接口报错：{detail} {_message(resp)}".strip(),
                         status=resp.status_code,
-                        reason=reason,
                     )
                 error = GoogleTransientError(f"Google 接口暂时不可用：{detail}")
             if attempt == MAX_ATTEMPTS - 1:

@@ -162,6 +162,26 @@ def test_config_errors_keep_token_and_explain(cfg):
     assert store.load() == old
 
 
+def test_wider_margin_refreshes_earlier(cfg):
+    auth, session, store = make_auth(cfg, queue(FakeResponse(200, token_body())))
+    stored_token(store, access_left=600)
+    assert auth.access_token() == "u-old"
+    assert auth.access_token(margin=1200) == "u-new"
+    assert len(session.calls) == 1
+
+
+def test_held_refresh_never_rotates(cfg):
+    auth, session, store = make_auth(cfg, queue())
+    old = stored_token(store, access_left=3600)
+    auth.hold_refresh()
+    assert auth.access_token() == "u-old"
+    auth.invalidate_access_token()
+    with pytest.raises(FeishuTransientError, match="下一轮"):
+        auth.access_token()
+    assert session.calls == []
+    assert store.load().refresh_token == old.refresh_token
+
+
 def test_invalidate_forces_refresh(cfg):
     auth, session, store = make_auth(cfg, queue(FakeResponse(200, token_body())))
     stored_token(store, access_left=3600)

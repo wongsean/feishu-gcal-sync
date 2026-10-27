@@ -10,9 +10,22 @@ Group=fgs
 WorkingDirectory=/var/lib/feishu-gcal-sync
 ExecStart=/opt/feishu-gcal-sync/.venv/bin/fgs --env-file /etc/feishu-gcal-sync/env sync
 TimeoutStartSec=15min
+# SIGTERM waits while a refresh_token rotation is on the wire: up to two requests with 30s
+# connect and read timeouts, plus DNS lookups no timeout covers. Being killed then loses
+# the grant.
+TimeoutStopSec=4min
+MemoryMax=256M
 
+# The job reads its config, writes its state directory and makes outbound HTTPS calls.
 NoNewPrivileges=yes
-PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/feishu-gcal-sync
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

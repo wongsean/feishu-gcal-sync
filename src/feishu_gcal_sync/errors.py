@@ -34,13 +34,26 @@ class FeishuApiError(SyncError):
         self.code = code
 
 
+class FeishuQuotaExhausted(SyncError):
+    """The tenant's monthly OpenAPI allowance (shared by all its self-built apps on the free
+    edition) is used up; calls fail until the 1st of next month."""
+
+    alert_key = "feishu_quota"
+
+
 class GoogleApiError(SyncError):
     alert_key = "google_api"
 
-    def __init__(self, message: str, status: int | None = None, reason: str | None = None):
+    def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
-        self.reason = reason
+
+
+class GoogleWritesFailed(GoogleApiError):
+    """Google rejected some writes; both calendars were read and the other writes went
+    through."""
+
+    alert_key = "google_writes"
 
 
 class GoogleQuotaError(SyncError):

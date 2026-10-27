@@ -6,7 +6,12 @@ import pytest
 from conftest import with_settings
 from test_model import timed
 
-from feishu_gcal_sync.errors import FeishuApiError, GoogleApiError, SafetyAbort
+from feishu_gcal_sync.errors import (
+    FeishuApiError,
+    GoogleApiError,
+    GoogleWritesFailed,
+    SafetyAbort,
+)
 from feishu_gcal_sync.model import google_event_id, to_google_event
 from feishu_gcal_sync.sync import run_sync
 
@@ -19,10 +24,7 @@ class FakeFeishu:
         self.error = error
         self.window = None
 
-    def primary_calendar_id(self):
-        return "primary-cal"
-
-    def instances(self, calendar_id, start, end):
+    def primary_instances(self, start, end):
         if self.error:
             raise self.error
         self.window = (start, end)
@@ -117,7 +119,7 @@ def test_one_failed_write_does_not_block_the_rest(cfg):
     first = timed()
     second = timed(event_id="other_0", summary="另一个")
     google = FakeGoogle(fail_ids={to_google_event(first)["id"]})
-    with pytest.raises(GoogleApiError, match="1 个 Google 写入失败"):
+    with pytest.raises(GoogleWritesFailed, match="1 个 Google 写入失败"):
         run_sync(cfg, FakeFeishu([first, second]), google, now=NOW)
     assert google.writes == [("insert", to_google_event(second)["id"])]
 
